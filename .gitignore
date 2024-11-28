@@ -1,2 +1,4 @@
 .env
-email_backups/1_Fw
+email_backups
+attachments
+checked.txt
