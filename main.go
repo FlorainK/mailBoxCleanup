@@ -1,101 +1,150 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
+	"errors"
+	"io"
 	"log"
 	"os"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	_ "github.com/emersion/go-message/charset"
+	"github.com/emersion/go-message/mail"
 	"github.com/joho/godotenv"
 )
 
-type EmailFetchDTO struct {
-	fetchMessageData *imapclient.FetchMessageData
-	fetchCommand     *imapclient.FetchCommand
+type EmailStreamDTO struct {
+	Reader *mail.Reader
+	SeqNum uint32
 }
 
-type EmailContentDTO struct {
-}
+func fetchInboxEmails(
+	connection *imapclient.Client,
+	out chan<- EmailStreamDTO,
+) {
+	defer close(out)
 
-func fetchInboxEmails(connection *imapclient.Client, outChannel chan<- *imapclient.FetchMessageBuffer) {
-	selectedMbox, err := connection.Select("INBOX", nil).Wait()
+	mbox, err := connection.Select("INBOX", nil).Wait()
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	if selectedMbox.NumMessages < 1 {
+	if mbox.NumMessages == 0 {
+		log.Println("Inbox empty")
 		return
 	}
 
-	log.Printf("Selected inbox contains %v messages", selectedMbox.NumMessages)
-
 	seqSet := imap.SeqSetNum(1)
-	fetchOptions := &imap.FetchOptions{
-		Envelope: true,
-		BodySection: []*imap.FetchItemBodySection{
-			{},
-		},
+
+	bodySection := &imap.FetchItemBodySection{}
+	opts := &imap.FetchOptions{
+		BodySection: []*imap.FetchItemBodySection{bodySection},
 	}
-	fetchCommand := connection.Fetch(seqSet, fetchOptions)
-	go func() {
-		defer close(outChannel)
+
+	cmd := connection.Fetch(seqSet, opts)
+	defer cmd.Close()
+
+	for {
+		msg := cmd.Next()
+		if msg == nil {
+			break
+		}
+
+		var body imapclient.FetchItemDataBodySection
+		found := false
+
 		for {
-			fetchMessageData := fetchCommand.Next()
-			if fetchMessageData == nil {
+			item := msg.Next()
+			if item == nil {
 				break
 			}
-			if buffer, err := fetchMessageData.Collect(); err != nil {
-				log.Fatal(err)
-			} else {
-				outChannel <- buffer
+			if bs, ok := item.(imapclient.FetchItemDataBodySection); ok {
+				body = bs
+				found = true
+				break
 			}
-			log.Printf("successfully attached email dto to out channel")
 		}
-		if err = fetchCommand.Close(); err != nil {
-			log.Fatal(err)
+
+		if !found {
+			log.Println("message without BODY[]")
+			continue
 		}
-	}()
+
+		raw, err := io.ReadAll(body.Literal)
+		if err != nil {
+			log.Printf("failed to read message body: %v", err)
+			continue
+		}
+
+		mr, err := mail.CreateReader(bytes.NewReader(raw))
+		if err != nil {
+			log.Printf("failed to create mail reader: %v", err)
+			continue
+		}
+
+		out <- EmailStreamDTO{
+			Reader: mr,
+			SeqNum: msg.SeqNum,
+		}
+	}
 }
 
-func unpackInboxEmail(inChannel <-chan *imapclient.FetchMessageBuffer) {
+func unpackInboxEmail(in <-chan EmailStreamDTO) {
 	go func() {
-		for buffer := range inChannel {
-			fmt.Println("received a message")
-			fmt.Println("Subject: ", buffer.Envelope.Subject)
+		for msg := range in {
+			h := msg.Reader.Header
 
+			subject, _ := h.Text("Subject")
+			log.Printf("Seq %d | Subject: %s", msg.SeqNum, subject)
+
+			for {
+				part, err := msg.Reader.NextPart()
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					log.Fatal(err)
+				}
+
+				switch h := part.Header.(type) {
+				case *mail.InlineHeader:
+					body, _ := io.ReadAll(part.Body)
+					log.Printf("Inline text (%d bytes)", len(body))
+
+				case *mail.AttachmentHeader:
+					filename, _ := h.Filename()
+					log.Printf("Attachment: %s", filename)
+				}
+			}
 		}
 	}()
 }
 
 func main() {
-	err := godotenv.Load()
-	if err != nil {
+	if err := godotenv.Load(); err != nil {
 		log.Fatal(err)
 	}
 
-	connection, err := imapclient.DialTLS("imap.gmx.com:993", nil)
+	c, err := imapclient.DialTLS("imap.gmx.com:993", nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer connection.Close()
+	defer c.Close()
 
-	username := os.Getenv("EMAIL")
-	password := os.Getenv("EMAIL_PASSWORD")
-	if err = connection.Login(username, password).Wait(); err != nil {
+	if err := c.Login(
+		os.Getenv("EMAIL"),
+		os.Getenv("EMAIL_PASSWORD"),
+	).Wait(); err != nil {
 		log.Fatal(err)
 	}
 
 	log.Println("Logged in")
 
-	// 2. fetch all emails in inbox
-	emailMessageDataChannel := make(chan *imapclient.FetchMessageBuffer, 50)
-	go fetchInboxEmails(connection, emailMessageDataChannel)
-	go unpackInboxEmail(emailMessageDataChannel)
-	time.Sleep(time.Second * 60)
-}
+	ch := make(chan EmailStreamDTO, 10)
 
-// steps:
-// 3. classify keep or delete
-// 4. delete and backup or continue as is
+	go fetchInboxEmails(c, ch)
+	go unpackInboxEmail(ch)
+
+	time.Sleep(time.Minute)
+}
